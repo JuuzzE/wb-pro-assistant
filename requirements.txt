@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+chromadb
+sentence-transformers
+groq
+requests
+pandas
+fastapi[all]
+openai

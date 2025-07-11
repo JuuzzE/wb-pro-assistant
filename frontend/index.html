@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WB Pro Assistant</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Ответы на отзывы ИНТЕРШУЗ</h1>
+        <p class="subtitle">Тест генерации ответов на основе ИИ</p>
+        <textarea id="reviewInput" placeholder="Вставьте сюда отзыв клиента..."></textarea>
+        <button id="generateBtn">✨ Сгенерировать ответ</button>
+        <div id="loader" class="loader" style="display: none;"></div>
+        <div id="resultArea" class="result-area" style="display: none;">
+            <h2>Анализ отзыва:</h2>
+            <!-- <<< ИЗМЕНЕНИЕ: Добавили место для психотипа >>> -->
+            <p id="analysisOutput"></p>
+            <h2>Готовый ответ (можно редактировать):</h2>
+            <textarea id="responseOutput"></textarea>
+            <button id="copyBtn">Копировать ответ</button>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
