@@ -10,6 +10,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 from dotenv import load_dotenv
+import asyncio
 
 # --- 1. ИНИЦИАЛИЗАЦИЯ ---
 load_dotenv()
@@ -24,51 +25,24 @@ try:
 except Exception as e:
     perplexity_client = None
 
-# --- Промпты ---
-PSYCHOTYPES_ANALYSIS_PROMPT = """
-Ты — сверхточный эксперт-аналитик. Твоя задача — без ошибок извлечь из отзыва покупателя обуви структурированную информацию.
-# Задача:
-Проанализируй отзыв и верни ТОЛЬКО JSON-объект. ЗАПОЛНИ ВСЕ ПОЛЯ.
-{
-  "customer_name": "Имя клиента из отзыва, или 'Покупатель' если имени нет.",
-  "product_article": "Артикул WB, на который написан отзыв. Найди его в тексте или метаданных. Если артикула нет, укажи null.",
-  "product_type": "ОПРЕДЕЛИ ТИП ОБУВИ одним словом (например: 'сабо', 'босоножки', 'кеды', 'туфли'). Если определить невозможно, укажи null.",
-  "brand_mentioned": "МАКСИМАЛЬНО ТОЧНОЕ название бренда из отзыва (например, 'Dino Ricci Select').",
-  "sentiment": "Positive/Negative/Neutral",
-  "psychotype": "Тестировщик/Импульсивная королева/Заботливая мама/Чеклист-реалист/Колеблющийся",
-  "main_problem": "Краткая суть проблемы клиента (например, 'стерлась подошва', 'жесткий ремешок'). Если отзыв позитивный, укажи null."
-}
-"""
-RESPONSE_RULES_PROMPT = """
-# Твоя личность и ГЛАВНОЕ ПРАВИЛО:
-Твоя основная задача — писать как образованный, интеллигентный и эмпатичный носитель русского языка. Речь должна быть абсолютно грамотной, естественной и человечной. Ошибки в грамматике и стилистике недопустимы. Ты — менеджер премиального бренда обуви.
-
-# ЗАПРЕЩЕННЫЕ ДЕЙСТВИЯ И ФРАЗЫ:
-1.  **Никогда** не используй обращения "Дорогая", "Уважаемая". Только "Здравствуйте".
-2.  **Никогда** не используй фразы "не соответствовала Вашим ожиданиям", "продукт для ваших потребностей".
-3.  **Никогда** не повторяй дословно проблему клиента.
-4.  **Никогда** не предлагай пустую помощь ("готовы помочь", "обращайтесь").
-5.  **Никогда** не упоминай артикул товара, на который написан отзыв.
-6.  **Никогда** не говори "передали на производство", если отзыв позитивный.
-7.  **Никогда не придумывай артикулы или детали о товарах.** Используй только те данные, что даны тебе в блоке "рекомендация".
-"""
-
-# --- Глобальные переменные для хранения базы в памяти ---
+# --- Глобальные переменные и блокировка для ленивой загрузки ---
 st_model = None
 product_collection = None
 db_client = None
+is_db_loaded = False
+db_load_lock = asyncio.Lock() # Блокировка, чтобы только один запрос запускал загрузку
 
-# --- ЛОГИКА СИНХРОНИЗАЦИИ ПРИ СТАРТЕ ---
-@app.on_event("startup")
-def load_and_sync_database():
-    global st_model, product_collection, db_client
-    print("Запуск сервера: начинаю загрузку и синхронизацию базы знаний...")
+# --- Функции, которые теперь будут вызываться при ленивой загрузке ---
+def _load_and_sync_database_sync():
+    """Синхронная функция, выполняющая всю тяжелую работу по загрузке."""
+    global st_model, product_collection, db_client, is_db_loaded
+
+    print("Запуск синхронизации базы знаний...")
     st_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', cache_folder='./st_cache')
-    db_client = chromadb.Client()
+    db_client = chromadb.Client() # ephemeral, in-memory
     product_collection = db_client.get_or_create_collection(name="wb_products_in_memory")
 
     WB_CONTENT_TOKEN = os.environ.get("WB_CONTENT_TOKEN")
-    WB_API_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list"
     if not WB_CONTENT_TOKEN:
         print("КРИТИЧЕСКАЯ ОШИБКА: Токен WB_CONTENT_TOKEN не найден!")
         return
@@ -80,22 +54,30 @@ def load_and_sync_database():
     print("Начинаю загрузку товаров с Wildberries...")
     while True:
         try:
-            response = requests.post(WB_API_URL, json=payload, headers=headers)
-            if response.status_code != 200: break
+            response = requests.post("https://content-api.wildberries.ru/content/v2/get/cards/list", json=payload, headers=headers)
+            if response.status_code != 200:
+                print(f"Ошибка от WB API: {response.status_code}, {response.text}")
+                break
             data = response.json()
             cards = data.get('cards', [])
             cursor = data.get('cursor', {})
             total = cursor.get('total', 0)
-            if not cards: break
+            if not cards:
+                print("Сервер WB вернул пустой список, загрузка завершена.")
+                break
             all_cards.extend(cards)
             print(f"-> Загружено {len(all_cards)} из (примерно) {total} карточек...")
-            if 'updatedAt' not in cursor or 'nmID' not in cursor: break
-            if len(all_cards) >= total and total > 0: break
+            if 'updatedAt' not in cursor or 'nmID' not in cursor:
+                print("В ответе WB отсутствует курсор, загрузка завершена.")
+                break
+            if len(all_cards) >= total and total > 0:
+                print("Загружены все карточки согласно полю 'total'.")
+                break
             payload['settings']['cursor']['updatedAt'] = cursor.get('updatedAt')
             payload['settings']['cursor']['nmID'] = cursor.get('nmID')
             time.sleep(0.7)
         except requests.exceptions.RequestException as e:
-            print(f"Ошибка при запросе к WB API: {e}")
+            print(f"Сетевая ошибка при запросе к WB API: {e}")
             break
     
     if all_cards:
@@ -106,18 +88,27 @@ def load_and_sync_database():
             title = card.get('title', '')
             description = card.get('description', '')
             brand = card.get('brand', '')
-            characteristics_text = " ".join([f"{char.get('name')}: {char.get('value')}" for char in card.get('characteristics', []) if isinstance(char.get('value'), (str, int, float))])
-            doc = f"Название: {title}. Бренд: {brand}. Описание: {description}. Характеристики: {characteristics_text}"
+            doc = f"Название: {title}. Бренд: {brand}. Описание: {description}."
             documents.append(doc)
             metadatas.append({'article': nm_id, 'name': title, 'brand': brand})
             ids.append(str(nm_id))
+        
         embeddings = st_model.encode(documents).tolist()
         product_collection.add(embeddings=embeddings, documents=documents, metadatas=metadatas, ids=ids)
         print(f"База знаний успешно создана в памяти. {len(ids)} товаров.")
+        is_db_loaded = True
     else:
         print("Не удалось загрузить товары с WB. База знаний будет пустой.")
 
-# --- МОДЕЛИ ДАННЫХ И ФУНКЦИИ ---
+async def ensure_db_is_loaded():
+    """Асинхронная обертка для ленивой загрузки, использующая блокировку."""
+    global is_db_loaded
+    if not is_db_loaded:
+        async with db_load_lock:
+            if not is_db_loaded:
+                await asyncio.to_thread(_load_and_sync_database_sync)
+
+# --- Остальные функции ---
 class ReviewRequest(BaseModel):
     review_text: str
 
@@ -161,6 +152,36 @@ def clean_response(text: str):
 # --- ГЛАВНЫЙ ЭНДПОИНТ API ---
 @app.post("/generate-response")
 async def generate_response(request: ReviewRequest):
+    await ensure_db_is_loaded()
+    
+    PSYCHOTYPES_ANALYSIS_PROMPT = """
+    Ты — сверхточный эксперт-аналитик. Твоя задача — без ошибок извлечь из отзыва покупателя обуви структурированную информацию.
+    # Задача:
+    Проанализируй отзыв и верни ТОЛЬКО JSON-объект. ЗАПОЛНИ ВСЕ ПОЛЯ.
+    {
+      "customer_name": "Имя клиента из отзыва, или 'Покупатель' если имени нет.",
+      "product_article": "Артикул WB, на который написан отзыв. Найди его в тексте или метаданных. Если артикула нет, укажи null.",
+      "product_type": "ОПРЕДЕЛИ ТИП ОБУВИ одним словом (например: 'сабо', 'босоножки', 'кеды', 'туфли'). Если определить невозможно, укажи null.",
+      "brand_mentioned": "МАКСИМАЛЬНО ТОЧНОЕ название бренда из отзыва (например, 'Dino Ricci Select').",
+      "sentiment": "Positive/Negative/Neutral",
+      "psychotype": "Тестировщик/Импульсивная королева/Заботливая мама/Чеклист-реалист/Колеблющийся",
+      "main_problem": "Краткая суть проблемы клиента (например, 'стерлась подошва', 'жесткий ремешок'). Если отзыв позитивный, укажи null."
+    }
+    """
+    RESPONSE_RULES_PROMPT = """
+    # Твоя личность и ГЛАВНОЕ ПРАВИЛО:
+    Твоя основная задача — писать как образованный, интеллигентный и эмпатичный носитель русского языка. Речь должна быть абсолютно грамотной, естественной и человечной. Ошибки в грамматике и стилистике недопустимы. Ты — менеджер премиального бренда обуви.
+
+    # ЗАПРЕЩЕННЫЕ ДЕЙСТВИЯ И ФРАЗЫ:
+    1.  **Никогда** не используй обращения "Дорогая", "Уважаемая". Только "Здравствуйте".
+    2.  **Никогда** не используй фразы "не соответствовала Вашим ожиданиям", "продукт для ваших потребностей".
+    3.  **Никогда** не повторяй дословно проблему клиента.
+    4.  **Никогда** не предлагай пустую помощь ("готовы помочь", "обращайтесь").
+    5.  **Никогда** не упоминай артикул товара, на который написан отзыв.
+    6.  **Никогда** не говори "передали на производство", если отзыв позитивный.
+    7.  **Никогда не придумывай артикулы или детали о товарах.** Используй только те данные, что даны тебе в блоке "рекомендация".
+    """
+
     analysis_system_prompt = f"{PSYCHOTYPES_ANALYSIS_PROMPT}\nПроанализируй отзыв и верни ТОЛЬКО JSON-объект, заключенный в ```json ... ```."
     analysis_user_prompt = f"Отзыв: '{request.review_text}'"
     analysis_result_str = call_llm(analysis_system_prompt, analysis_user_prompt, temperature=0.1)
