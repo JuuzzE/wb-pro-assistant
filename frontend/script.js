@@ -1,5 +1,6 @@
 // Замените на URL вашего сервера на Render, когда будете готовы
-const API_URL = 'http://127.0.0.1:8000'; 
+// const API_URL = 'http://127.0.0.1:8000'; // Старая строка
+const API_URL = 'http://127.0.0.1:8000'; // Новая строка
 
 const reviewInput = document.getElementById('reviewInput');
 const generateBtn = document.getElementById('generateBtn');
